@@ -9,6 +9,9 @@
 #     and pulls Newtonsoft.Json / SharpDX out of FrostyEditor\ThirdParty.
 #   * Builds the plugin with MSBuild for x64 in the Frosty configuration names
 #     ("Developer - Debug", "Release - Final").
+#     Workspace layout: the plugin is checked out into ./plugin and the Toolsuite
+#     into ./FrostyToolsuite, i.e. two sibling directories - the Toolsuite must
+#     not sit inside the plugin's project directory (see the checkout step).
 #   * Verifies the produced DLL is a .NET Framework v4.0.30319 (net48) assembly
 #     and that the post-build copy into FrostyEditor\bin\...\Plugins\ happened.
 #   * Uploads the DLL/PDB as artifacts; on a v* tag it packages a release asset.
@@ -103,6 +106,12 @@ jobs:
       - name: Checkout plugin
         uses: actions/checkout@v7
         with:
+          # The plugin must live in its own subdirectory, next to (not containing)
+          # the Toolsuite: the SDK-style project compiles **/*.cs below its own
+          # directory, so a Toolsuite checked out inside it would drag in
+          # FrostySdk/FrostyControls/FrostyPlugin/Plugins sources and fail with
+          # CS0579 duplicate-attribute / CS0101 duplicate-type errors.
+          path: plugin
           persist-credentials: false
 
       - name: Checkout FrostyToolsuite (${{ env.FROSTY_TOOLSUITE_REF }})
@@ -156,7 +165,7 @@ jobs:
               (Join-Path $root 'FrostySdk\FrostySdk.csproj')
               (Join-Path $root 'FrostyControls\FrostyControls.csproj')
               (Join-Path $root 'FrostyPlugin\FrostyCore.csproj')
-              (Join-Path $env:GITHUB_WORKSPACE 'FrostyMcpPlugin.csproj')
+              (Join-Path $env:GITHUB_WORKSPACE 'plugin/FrostyMcpPlugin.csproj')
           )
           $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue
           foreach ($project in $targets) {
@@ -194,7 +203,7 @@ jobs:
           # Building the project directly propagates the global
           # Configuration/Platform to every ProjectReference instead.
           $msbuildArgs = @(
-              'FrostyMcpPlugin.csproj'
+              (Join-Path $env:GITHUB_WORKSPACE 'plugin/FrostyMcpPlugin.csproj')
               '-nologo'
               '-m'
               '-v:minimal'
@@ -240,7 +249,7 @@ jobs:
           OUTDIR: ${{ matrix.outdir }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $dll = Join-Path $env:GITHUB_WORKSPACE ("$($env:OUTDIR)/FrostyMcpPlugin.dll")
+          $dll = Join-Path $env:GITHUB_WORKSPACE ("plugin/$($env:OUTDIR)/FrostyMcpPlugin.dll")
           if (-not (Test-Path $dll)) { throw "Build output missing: $dll" }
 
           $asm = [System.Reflection.AssemblyName]::GetAssemblyName($dll)
@@ -274,7 +283,7 @@ jobs:
               ''
               '| item | value |'
               '| --- | --- |'
-              "| DLL | ``$($env:OUTDIR)/FrostyMcpPlugin.dll`` ($size bytes) |"
+              "| DLL | ``plugin/$($env:OUTDIR)/FrostyMcpPlugin.dll`` ($size bytes) |"
               "| CLR header | $($asm.ImageRuntimeVersion) |"
               "| Architecture | $($asm.ProcessorArchitecture) |"
               "| Editor plugin copy | ``FrostyToolsuite/FrostyEditor/$($env:OUTDIR)/Plugins/FrostyMcpPlugin.dll`` |"
@@ -284,7 +293,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: FrostyMcpPlugin-${{ matrix.slug }}-x64-${{ matrix.os }}
-          path: ${{ matrix.outdir }}/FrostyMcpPlugin.*
+          path: plugin/${{ matrix.outdir }}/FrostyMcpPlugin.*
           if-no-files-found: error
           retention-days: 14
 
@@ -308,9 +317,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'pkg'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "$($env:OUTDIR)/FrostyMcpPlugin.dll") $stage
-          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'MCP_Server/mcp_frosty.py') $stage
-          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'MCP_Server/requirements.txt') $stage
+          $pluginRoot = Join-Path $env:GITHUB_WORKSPACE 'plugin'
+          Copy-Item (Join-Path $pluginRoot "$($env:OUTDIR)/FrostyMcpPlugin.dll") $stage
+          Copy-Item (Join-Path $pluginRoot 'MCP_Server/mcp_frosty.py') $stage
+          Copy-Item (Join-Path $pluginRoot 'MCP_Server/requirements.txt') $stage
           $zip = "FrostyMcpPlugin-$env:GITHUB_REF_NAME-x64.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
           Write-Host "Packaged $zip"
