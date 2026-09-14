@@ -184,8 +184,17 @@ jobs:
           $logFile = Join-Path $env:RUNNER_TEMP 'msbuild.log'
           Write-Host "Configuration: $env:CONFIGURATION"
           Write-Host "FrostyRoot   : $frostyRoot"
+          # NOTE: the .sln is intentionally NOT used here. A solution build
+          # rewrites Configuration/Platform per project from the .sln's
+          # configuration table, and for the referenced projects (which are not
+          # part of FrostyMcpPlugin.sln) MSBuild falls back to Platform=AnyCPU.
+          # The Frosty projects only define 'Developer - Debug|x64' style names,
+          # so they lose their OutputPath and the build dies with
+          # "The BaseOutputPath/OutputPath property is not set for project ...".
+          # Building the project directly propagates the global
+          # Configuration/Platform to every ProjectReference instead.
           $msbuildArgs = @(
-              'FrostyMcpPlugin.sln'
+              'FrostyMcpPlugin.csproj'
               '-nologo'
               '-m'
               '-v:minimal'
