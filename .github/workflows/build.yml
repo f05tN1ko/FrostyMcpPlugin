@@ -273,7 +273,7 @@ jobs:
           Write-Problem ("dotnet sdks: " + ((& dotnet --list-sdks) -join '; '))
           throw "MSBuild failed with exit code $code"
 
-      - name: Verify build output (net48 + x64, probed with the in-box .NET Framework)
+      - name: Verify build output (net48 + x64, read from the PE headers)
         env:
           OUTDIR: ${{ matrix.outdir }}
         run: |
@@ -305,27 +305,78 @@ jobs:
               if ($candidates.Count -ne 1) { throw "cannot identify the built plugin DLL ($($candidates.Count) candidate(s))" }
               $dll = $candidates[0].FullName
           }
-          $size = (Get-Item $dll).Length
 
-          # Probe the artifact with Windows PowerShell 5.1 - the in-box .NET
-          # Framework 4.8 that Windows 10 21H2 ships. pwsh 7 runs on .NET 9,
-          # where AssemblyName.ImageRuntimeVersion is always empty and
-          # ProcessorArchitecture is always None, so it cannot answer
-          # "will this load in Frosty Editor on 21H2?".
-          $probeScript = '& { $ErrorActionPreference = "Stop"; $a = [System.Reflection.AssemblyName]::GetAssemblyName("' + $dll + '"); [string]::Format("{0}|{1}|{2}|{3}", $a.ImageRuntimeVersion, $a.ProcessorArchitecture, $a.Version, [System.Environment]::Version.ToString()) }'
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probeScript))
-          $probe = [string](& powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded)
-          $fields = $probe.Trim().Split('|')
-          if ($fields.Count -lt 4) {
-              Note "the in-box .NET Framework probe returned unreadable output: '$probe'"
-              throw 'in-box .NET Framework probe failed'
+          # Read the PE / CLI headers straight out of the file. Reflection is not
+          # usable here: AssemblyName.ImageRuntimeVersion is empty under pwsh 7
+          # (.NET 9) and returns nothing useful under Windows PowerShell 5.1
+          # either, and this check has to be trustworthy in both.
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+          function U16([int] $offset) { [BitConverter]::ToUInt16($bytes, $offset) }
+          function U32([int] $offset) { [BitConverter]::ToUInt32($bytes, $offset) }
+
+          $dllSize = $bytes.Length
+          if ($dllSize -lt 256) { Note "not a PE file ($dllSize bytes): $dll"; throw 'artifact is not a PE file' }
+          $peOffset = U32 0x3c
+          if ($peOffset -lt 0x40 -or $peOffset + 24 -gt $dllSize -or (U32 $peOffset) -ne 0x00004550) {
+              Note "no PE signature at 0x$('{0:x}' -f $peOffset) in $dll"
+              throw 'artifact is not a PE file'
           }
-          $clr, $arch, $asmVersion, $fxVersion = $fields
-          Write-Host "Artifact             : $dll ($size bytes)"
-          Write-Host "Assembly version     : $asmVersion"
-          Write-Host "CLR image version    : $clr"
-          Write-Host "ProcessorArchitecture: $arch"
-          Write-Host "Probing framework    : $fxVersion (in-box, Windows PowerShell 5.1)"
+
+          $machine = U16 ($peOffset + 4)
+          $sectionCount = U16 ($peOffset + 6)
+          $optionalSize = U16 ($peOffset + 20)
+          $optional = $peOffset + 24
+          $magic = U16 $optional
+          $isPe32Plus = $magic -eq 0x20b
+          $dataDirs = $optional + $(if ($isPe32Plus) { 112 } else { 96 })
+          $cliRva = U32 ($dataDirs + 14 * 8)
+
+          $sections = @()
+          $sectionTable = $optional + $optionalSize
+          for ($i = 0; $i -lt $sectionCount; $i++) {
+              $header = $sectionTable + $i * 40
+              $sections += [pscustomobject]@{
+                  VirtualSize = U32 ($header + 8)
+                  VirtualAddress = U32 ($header + 12)
+                  RawPointer = U32 ($header + 20)
+              }
+          }
+          function RvaToOffset([int] $rva) {
+              foreach ($section in $sections) {
+                  if ($rva -ge $section.VirtualAddress -and $rva -lt ($section.VirtualAddress + $section.VirtualSize)) {
+                      return $section.RawPointer + ($rva - $section.VirtualAddress)
+                  }
+              }
+              return -1
+          }
+
+          $clrFlags = $null
+          $runtimeVersion = ''
+          if ($cliRva -eq 0) {
+              Note "no CLI header (data directory 14 is empty) - $dll is a native image, not a managed assembly"
+          } else {
+              $cliOffset = RvaToOffset $cliRva
+              $clrFlags = U32 ($cliOffset + 16)
+              $metadataOffset = RvaToOffset (U32 ($cliOffset + 8))
+              $versionLength = U32 $metadataOffset
+              $runtimeVersion = [Text.Encoding]::UTF8.GetString($bytes, $metadataOffset + 4, $versionLength).TrimEnd([char] 0)
+          }
+
+          $machineName = switch ($machine) {
+              0x8664 { 'x64' }
+              0x14c { 'x86' }
+              0xaa64 { 'arm64' }
+              default { '0x{0:x}' -f $machine }
+          }
+          $ilOnly = if ($null -ne $clrFlags) { ($clrFlags -band 0x1) -ne 0 } else { $false }
+
+          # Evidence that the artifact targets the framework 21H2 ships in the box.
+          $inBox = [string](& powershell.exe -NoProfile -NonInteractive -Command '[System.Environment]::Version.ToString()')
+
+          Write-Host "Artifact          : $dll ($dllSize bytes)"
+          Write-Host "PE machine        : $machineName (PE32+ = $isPe32Plus)"
+          Write-Host "CLI runtime       : $runtimeVersion (IL-only = $ilOnly)"
+          Write-Host "In-box framework  : $($inBox.Trim())"
 
           # The csproj PostBuild target copies the plugin into the editor's
           # Plugins folder. Accept it anywhere below FrostyEditor (the editor's
@@ -334,18 +385,17 @@ jobs:
           $copy = if ($copies.Count -gt 0) { $copies[0].FullName } else { $null }
 
           $problems = @()
-          if ($clr -ne 'v4.0.30319') {
-              $problems += "Expected a .NET Framework v4.0.30319 (net48) assembly but got '$clr' - it would not load in Frosty Editor on Windows 10 21H2."
+          if ($machine -ne 0x8664 -or -not $isPe32Plus) {
+              $problems += "Expected an x64 image (machine 0x8664, PE32+) but got machine $machineName / PE32+ = $isPe32Plus - Frosty Editor (and its FrostySdk dependency) is x64 only."
           }
-          switch ($arch) {
-              'Amd64' { Write-Host 'x64 assembly: OK' }
-              'MSIL' {
-                  Write-Warning 'Assembly is AnyCPU (MSIL); Frosty Editor is x64 so this still loads, but -p:Platform=x64 did not reach the compiler.'
-              }
-              default { $problems += "Unexpected ProcessorArchitecture '$arch' for an x64 Frosty plugin." }
+          if ($runtimeVersion -ne 'v4.0.30319') {
+              $problems += "Expected CLR metadata version 'v4.0.30319' (net48) but got '$runtimeVersion' - it would not load in Frosty Editor on Windows 10 21H2."
+          }
+          if ($null -ne $clrFlags -and -not $ilOnly) {
+              Write-Warning 'CLI header lacks the IL-only flag (mixed mode); the plugin would need a matching native runtime on the target machine.'
           }
           if ($copy) {
-              Write-Host "Post-build copy      : $copy"
+              Write-Host "Post-build copy   : $copy"
           } else {
               $pluginsDirs = @(Get-ChildItem -Path $editorDir -Recurse -Directory -ErrorAction SilentlyContinue |
                   Where-Object { $_.Name -eq 'Plugins' } | Select-Object -First 10 |
@@ -360,15 +410,14 @@ jobs:
           }
 
           @(
-              'Build verified for Windows 10 21H2+ (net48, x64) - probed with the in-box .NET Framework'
+              'Build verified for Windows 10 21H2+ (net48, x64)'
               ''
               '| item | value |'
               '| --- | --- |'
-              "| DLL | ``$($dll.Replace($env:GITHUB_WORKSPACE, ''))`` ($size bytes) |"
-              "| Assembly version | $asmVersion |"
-              "| CLR image version | $clr |"
-              "| ProcessorArchitecture | $arch |"
-              "| Probing framework | $fxVersion |"
+              "| DLL | ``$($dll.Replace($env:GITHUB_WORKSPACE, ''))`` ($dllSize bytes) |"
+              "| PE machine | $machineName (PE32+ = $isPe32Plus) |"
+              "| CLI runtime | $runtimeVersion (IL-only = $ilOnly) |"
+              "| In-box .NET Framework | $($inBox.Trim()) |"
               "| Editor plugin copy | ``$($copy.Replace($env:GITHUB_WORKSPACE, ''))`` |"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
