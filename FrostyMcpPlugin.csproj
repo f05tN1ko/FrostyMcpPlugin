@@ -40,6 +40,20 @@
     <Optimize>true</Optimize>
   </PropertyGroup>
 
+  <!-- YAML export: upstream FrostyToolsuite has no EbxYamlWriter, only EbxXmlWriter.
+       Define FROSTY_HAS_YAML_WRITER when the Toolsuite in $(FrostyRoot) does provide
+       FrostySdk\IO\EbxYamlWriter.cs whose constructor takes (Stream, AssetManager) -
+       the signature Bridge/McpHandlers.cs calls.  Pass /p:FrostyHasYamlWriter=false
+       to force it off for a Toolsuite whose writer has another signature (e.g.
+       HarGabt/FrostyToolsuite takes (EbxAsset, Stream, AssetManager, int, bool)). -->
+  <PropertyGroup>
+    <FrostyHasYamlWriter Condition="'$(FrostyHasYamlWriter)' == '' And Exists('$(FrostyRoot)FrostySdk\IO\EbxYamlWriter.cs')">true</FrostyHasYamlWriter>
+    <FrostyHasYamlWriter Condition="'$(FrostyHasYamlWriter)' == ''">false</FrostyHasYamlWriter>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(FrostyHasYamlWriter)' == 'true'">
+    <DefineConstants>$(DefineConstants);FROSTY_HAS_YAML_WRITER</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <Reference Include="PresentationCore" />
     <Reference Include="PresentationFramework" />

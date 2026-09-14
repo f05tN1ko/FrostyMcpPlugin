@@ -208,8 +208,20 @@ namespace FrostyMcpPlugin.Bridge
                     }
                     else
                     {
+#if FROSTY_HAS_YAML_WRITER
                         using (EbxYamlWriter writer = new EbxYamlWriter(ms, App.AssetManager))
                             writer.WriteObjects(asset.RootObjects);
+#else
+                        // Upstream FrostyToolsuite (every branch up to 1.0.7) ships
+                        // EbxXmlWriter only - there is no EbxYamlWriter anywhere in it.
+                        // FrostyMcpPlugin.csproj defines FROSTY_HAS_YAML_WRITER when the
+                        // Toolsuite under $(FrostyRoot) actually provides
+                        // FrostySdk/IO/EbxYamlWriter.cs with this constructor, so the
+                        // plugin compiles against a plain upstream checkout as well.
+                        return Error(
+                            "This FrostyToolsuite build has no EbxYamlWriter (FrostySdk/IO/EbxYamlWriter.cs); use get_ebx_xml, or build against a Toolsuite that provides it.",
+                            "YAML_NOT_SUPPORTED");
+#endif
                     }
                     text = Encoding.UTF8.GetString(ms.ToArray());
                 }

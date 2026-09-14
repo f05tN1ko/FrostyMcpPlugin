@@ -37,15 +37,17 @@
 #   repository variables FROSTY_TOOLSUITE_REPO / FROSTY_TOOLSUITE_REF, or per
 #   run through the workflow_dispatch inputs frosty_repo / frosty_ref.
 #
-# Known code-side blocker (not a workflow problem)
-#   Bridge/McpHandlers.cs GetEbxYaml() calls
+# Known code-side limitation (handled, not a workflow problem)
+#   Bridge/McpHandlers.cs used to call
 #       new EbxYamlWriter(ms, App.AssetManager) / writer.WriteObjects(asset.RootObjects)
-#   There is no EbxYamlWriter in ANY branch of CadeEvs/FrostyToolsuite
-#   (1.0.6 ... 1.0.7) - only EbxXmlWriter - and the fork that does have one
-#   (HarGabt/FrostyToolsuite) uses a different signature
-#   (EbxAsset, Stream, AssetManager, int, bool + parameterless WriteObjects()).
-#   Until that call site is fixed or a Toolsuite that provides the expected
-#   signature is used, the compile stops with CS0246 EbxYamlWriter.
+#   unconditionally, but no branch of CadeEvs/FrostyToolsuite (1.0.6 ... 1.0.7)
+#   contains EbxYamlWriter at all - only EbxXmlWriter.  That line now sits behind
+#   FROSTY_HAS_YAML_WRITER, which FrostyMcpPlugin.csproj defines only when the
+#   Toolsuite under $(FrostyRoot) really ships FrostySdk\IO\EbxYamlWriter.cs, so
+#   an upstream checkout compiles and get_ebx_yaml answers YAML_NOT_SUPPORTED.
+#   A fork that does have the class (HarGabt/FrostyToolsuite) uses a different
+#   signature, so for that one build with /p:FrostyHasYamlWriter=false - or port
+#   the call.  get_ebx_xml is unaffected.
 #
 # Manual run
 #   Actions -> build -> Run workflow, optionally overriding the FrostyToolsuite
