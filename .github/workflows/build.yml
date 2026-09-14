@@ -1,0 +1,390 @@
+# ---------------------------------------------------------------------------
+# FrostyMcpPlugin - build CI
+#
+# What it does
+#   * Checks out this repo (the plugin) AND a FrostyToolsuite checkout, because
+#     the plugin is not standalone: FrostyMcpPlugin.csproj resolves FrostySdk,
+#     FrostyControls, FrostyCore and FrostyHash (C++/CLI) through
+#         /p:FrostyRoot=<path to the folder that contains FrostyEditor / FrostySdk>
+#     and pulls Newtonsoft.Json / SharpDX out of FrostyEditor\ThirdParty.
+#   * Builds the plugin with MSBuild for x64 in the Frosty configuration names
+#     ("Developer - Debug", "Release - Final").
+#   * Verifies the produced DLL is a .NET Framework v4.0.30319 (net48) assembly
+#     and that the post-build copy into FrostyEditor\bin\...\Plugins\ happened.
+#   * Uploads the DLL/PDB as artifacts; on a v* tag it packages a release asset.
+#
+# Windows 10 21H2 support
+#   The plugin targets net48 (.NET Framework 4.8), which is the in-box .NET
+#   Framework version of Windows 10 21H2 (OS build 19044, .NET Framework 528040)
+#   and of every newer Windows 10 / 11 release, so a net48 + x64 plugin needs no
+#   extra runtime on the user's machine.
+#   The CI proves this by
+#     1. requiring the runner OS to be at least 19044 (the 21H2 build number),
+#     2. building with the same x64 / v143 toolchain the plugin ships with,
+#     3. asserting the artifact's CLR header targets .NET Framework 4.x (not
+#        .NET 5+/Core, which would NOT load inside Frosty Editor on 21H2).
+#   windows-2022 (Server 2022, build 20348 + VS2022 17.14: MSBuild v143, "C++/CLI
+#   support for v143", .NET Framework 4.8 targeting pack, Windows SDK 10.0.26100)
+#   is the baseline; windows-2025 is built too, as a forward-compatibility canary.
+#
+# Manual run
+#   Actions -> build -> Run workflow, optionally overriding the FrostyToolsuite
+#   ref (branch/tag/commit) that the plugin is compiled against.
+# ---------------------------------------------------------------------------
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      frosty_ref:
+        description: FrostyToolsuite branch/tag/commit to build against
+        required: false
+        type: string
+        default: 1.0.6.3
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Branch/tag of CadeEvs/FrostyToolsuite the plugin is compiled against.
+  FROSTY_TOOLSUITE_REF: ${{ github.event.inputs.frosty_ref || '1.0.6.3' }}
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Plugin build (the "at least Windows 10 21H2" gate lives here)
+  # -------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.configuration }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # needed only for the tag-triggered release steps
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental }}
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Baseline: Windows Server 2022 runner == the oldest runner that still
+          # has the VS2022 v143 toolset + C++/CLI support the Toolsuite needs.
+          - os: windows-2022
+            configuration: Developer - Debug
+            slug: debug
+            outdir: bin/Developer/Debug
+            release: false
+            experimental: false
+          - os: windows-2022
+            configuration: Release - Final
+            slug: release-final
+            outdir: bin/Release/Final
+            release: true
+            experimental: false
+          # Canary: same build on the newest Windows runner. Allowed to fail so a
+          # runner-image regression cannot block the baseline.
+          - os: windows-2025
+            configuration: Developer - Debug
+            slug: debug
+            outdir: bin/Developer/Debug
+            release: false
+            experimental: true
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout FrostyToolsuite (${{ env.FROSTY_TOOLSUITE_REF }})
+        uses: actions/checkout@v7
+        with:
+          repository: CadeEvs/FrostyToolsuite
+          ref: ${{ env.FROSTY_TOOLSUITE_REF }}
+          path: FrostyToolsuite
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Runner OS / Windows 10 21H2 baseline gate
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $build = [int]$os.BuildNumber
+          $line = "Runner OS: $($os.Caption) $($os.Version), build $build"
+          Write-Host $line
+          # 19044 = Windows 10 21H2. Runners are server SKUs and are always newer,
+          # but the check documents and enforces the floor we claim to support.
+          if ($build -lt 19044) {
+              throw "$($os.Caption) build $build is older than Windows 10 21H2 (19044); this workflow claims 21H2 support."
+          }
+          $toolsuite = Join-Path $env:GITHUB_WORKSPACE 'FrostyToolsuite'
+          $rev = (& git -C $toolsuite rev-parse HEAD).Trim()
+          $detail = @(
+              $line
+              "FrostyToolsuite: $rev ($env:FROSTY_TOOLSUITE_REF)"
+              "Configuration  : ${{ matrix.configuration }} | Platform: x64"
+              "Target runtime : net48 (.NET Framework 4.8, in-box since Windows 10 21H2 / build 19044)"
+          )
+          $detail | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ env.FROSTY_TOOLSUITE_REF }}-${{ hashFiles('**/*.csproj', '**/*.vcxproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-${{ env.FROSTY_TOOLSUITE_REF }}-
+
+      - name: Set up MSBuild (VS2022, v143 + C++/CLI)
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+
+      - name: Restore NuGet packages
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'FrostyToolsuite'
+          $targets = @(
+              (Join-Path $root 'FrostySdk\FrostySdk.csproj')
+              (Join-Path $root 'FrostyControls\FrostyControls.csproj')
+              (Join-Path $root 'FrostyPlugin\FrostyCore.csproj')
+              (Join-Path $env:GITHUB_WORKSPACE 'FrostyMcpPlugin.csproj')
+          )
+          $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue
+          foreach ($project in $targets) {
+              Write-Host "::group::NuGet restore $project"
+              & msbuild $project -nologo -v:minimal -t:Restore
+              $code = $LASTEXITCODE
+              if ($code -ne 0 -and $nuget) {
+                  Write-Warning "msbuild -t:Restore failed (exit $code); retrying with nuget.exe"
+                  & $nuget.Source restore $project -NonInteractive
+                  $code = $LASTEXITCODE
+              }
+              Write-Host '::endgroup::'
+              if ($code -ne 0) { throw "NuGet restore failed for $project (exit $code)" }
+          }
+
+      - name: Build plugin (MSBuild, x64)
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # FrostyRoot must end with a separator: the csproj appends "FrostySdk\...".
+          # Forward slashes keep the trailing separator unambiguous for argument
+          # passing; MSBuild accepts them on Windows.
+          $frostyRoot = (Join-Path $env:GITHUB_WORKSPACE 'FrostyToolsuite').Replace('\', '/') + '/'
+          Write-Host "Configuration: $env:CONFIGURATION"
+          Write-Host "FrostyRoot   : $frostyRoot"
+          $msbuildArgs = @(
+              'FrostyMcpPlugin.sln'
+              '-nologo'
+              '-m'
+              '-v:minimal'
+              "-p:Configuration=$env:CONFIGURATION"
+              '-p:Platform=x64'
+              "-p:FrostyRoot=$frostyRoot"
+              "-bl:$($env:GITHUB_WORKSPACE)/msbuild-${{ matrix.slug }}.binlog"
+          )
+          & msbuild @msbuildArgs
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
+
+      - name: Verify build output (.NET Framework 4.x, x64, post-build copy)
+        env:
+          OUTDIR: ${{ matrix.outdir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Join-Path $env:GITHUB_WORKSPACE ("$($env:OUTDIR)/FrostyMcpPlugin.dll")
+          if (-not (Test-Path $dll)) { throw "Build output missing: $dll" }
+
+          $asm = [System.Reflection.AssemblyName]::GetAssemblyName($dll)
+          $size = (Get-Item $dll).Length
+          Write-Host "Artifact            : $dll ($size bytes)"
+          Write-Host "ImageRuntimeVersion : $($asm.ImageRuntimeVersion)"
+          Write-Host "ProcessorArchitecture: $($asm.ProcessorArchitecture)"
+
+          # CLR header must be .NET Framework 4.x: that is what Windows 10 21H2
+          # (and Frosty Editor, itself net48) can load. A .NET 5+/Core assembly
+          # would build fine here but fail in Frosty on the target machine.
+          if ($asm.ImageRuntimeVersion -ne 'v4.0.30319') {
+              throw "Expected a .NET Framework v4.0.30319 (net48) assembly but got '$($asm.ImageRuntimeVersion)' - it would not load in Frosty Editor on Windows 10 21H2."
+          }
+          switch ($asm.ProcessorArchitecture) {
+              'Amd64' { Write-Host 'x64 assembly: OK' }
+              'MSIL' {
+                  Write-Warning 'Assembly is AnyCPU (MSIL); Frosty Editor is x64 so this still loads, but -p:Platform=x64 did not reach the compiler.'
+              }
+              default { throw "Unexpected ProcessorArchitecture '$($asm.ProcessorArchitecture)' for an x64 Frosty plugin." }
+          }
+
+          # The csproj PostBuild target copies the plugin into the editor's
+          # Plugins folder: FrostyEditor\<OutDir>Plugins\. Verify it really happened.
+          $copy = Join-Path $env:GITHUB_WORKSPACE ("FrostyToolsuite/FrostyEditor/$($env:OUTDIR)/Plugins/FrostyMcpPlugin.dll")
+          if (-not (Test-Path $copy)) { throw "Post-build plugin copy missing: $copy" }
+          Write-Host "Post-build copy     : $copy"
+
+          @(
+              'Build verified for Windows 10 21H2+ (net48, x64)'
+              ''
+              '| item | value |'
+              '| --- | --- |'
+              "| DLL | ``$($env:OUTDIR)/FrostyMcpPlugin.dll`` ($size bytes) |"
+              "| CLR header | $($asm.ImageRuntimeVersion) |"
+              "| Architecture | $($asm.ProcessorArchitecture) |"
+              "| Editor plugin copy | ``FrostyToolsuite/FrostyEditor/$($env:OUTDIR)/Plugins/FrostyMcpPlugin.dll`` |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: FrostyMcpPlugin-${{ matrix.slug }}-x64-${{ matrix.os }}
+          path: ${{ matrix.outdir }}/FrostyMcpPlugin.*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload MSBuild binlog (diagnostics)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: msbuild-binlog-${{ matrix.slug }}-${{ matrix.os }}
+          path: msbuild-*.binlog
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # -----------------------------------------------------------------------
+      # Release assets (only on v* tags, only from the "Release - Final" cell)
+      # -----------------------------------------------------------------------
+      - name: Package release bundle
+        if: matrix.release && startsWith(github.ref, 'refs/tags/v')
+        env:
+          OUTDIR: ${{ matrix.outdir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'pkg'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "$($env:OUTDIR)/FrostyMcpPlugin.dll") $stage
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'MCP_Server/mcp_frosty.py') $stage
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'MCP_Server/requirements.txt') $stage
+          $zip = "FrostyMcpPlugin-$env:GITHUB_REF_NAME-x64.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+          Write-Host "Packaged $zip"
+          Get-ChildItem $zip | Format-List Name, Length
+
+      - name: Publish to GitHub Releases
+        if: matrix.release && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $zip = "FrostyMcpPlugin-$tag-x64.zip"
+          & gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              & gh release create $tag --title $tag --generate-notes --verify-tag
+              if ($LASTEXITCODE -ne 0) { throw "gh release create $tag failed" }
+          }
+          & gh release upload $tag $zip --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload $tag failed" }
+          Write-Host "Released $zip on $tag"
+
+  # -------------------------------------------------------------------------
+  # Version strings must agree (README contribution rule)
+  # -------------------------------------------------------------------------
+  version-consistency:
+    name: Version strings agree
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Compare PluginVersion / bridge / MCP server / README versions
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          def read(path):
+              return pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+
+          def norm(value):
+              value = value.strip()
+              # [assembly: PluginVersion] is a 4-part version: 1.2.3.0 == 1.2.3
+              if re.fullmatch(r"\d+\.\d+\.\d+\.0", value):
+                  value = value[:-2]
+              return value
+
+          checks = {
+              "Properties/AssemblyInfo.cs [assembly: PluginVersion]":
+                  r'PluginVersion\("([^"]+)"\)',
+              "Bridge/McpBridgeServer.cs McpBridgeServer.Version":
+                  r'const\s+string\s+Version\s*=\s*"([^"]+)"',
+              "MCP_Server/mcp_frosty.py FROSTY_MCP_VERSION default":
+                  r'FROSTY_MCP_VERSION",\s*"([^"]+)"',
+              "README.md 'Plugin version'":
+                  r'Plugin version:\s*\*\*([^*]+)\*\*',
+          }
+
+          found = {}
+          for label, pattern in checks.items():
+              path = label.split(" ", 1)[0]
+              match = re.search(pattern, read(path))
+              if not match:
+                  print(f"::error::could not find a version string in {path} ({label})")
+                  sys.exit(1)
+              found[label] = norm(match.group(1))
+
+          width = max(len(k) for k in found)
+          for label, value in found.items():
+              print(f"{value:<10} {label}")
+          if len(set(found.values())) != 1:
+              print("::error::Version strings disagree - bump PluginVersion, McpBridgeServer.Version, FROSTY_MCP_VERSION and README.md together.")
+              sys.exit(1)
+          print(f"OK: all {len(found)} version strings agree")
+          PY
+
+  # -------------------------------------------------------------------------
+  # Python MCP server side of the bridge
+  # -------------------------------------------------------------------------
+  mcp-server:
+    name: MCP server (Python) sanity
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r MCP_Server/requirements.txt
+
+      - name: Dependency pin still matches the bridge (mcp 1.x + pywin32)
+        run: |
+          python -c "import importlib.metadata as md; v = md.version('mcp'); print('mcp', v); raise SystemExit(0 if v.split('.')[0] == '1' else 1)"
+          python -c "import importlib.metadata as md; print('pywin32', md.version('pywin32'))"
+
+      - name: Byte-compile and import the MCP server
+        run: |
+          python -m py_compile MCP_Server/mcp_frosty.py
+          python -c "import sys; sys.path.insert(0, 'MCP_Server'); import mcp_frosty; print('mcp_frosty import: OK')"
+          python -c "import asyncio, sys; sys.path.insert(0, 'MCP_Server'); import mcp_frosty; tools = asyncio.run(mcp_frosty.mcp.list_tools()); print(f'{len(tools)} MCP tools registered')"
