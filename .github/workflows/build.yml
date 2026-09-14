@@ -30,9 +30,26 @@
 #   support for v143", .NET Framework 4.8 targeting pack, Windows SDK 10.0.26100)
 #   is the baseline; windows-2025 is built too, as a forward-compatibility canary.
 #
+# Which FrostyToolsuite
+#   Defaults to CadeEvs/FrostyToolsuite @ 1.0.6.3; the plugin's XML bridge calls
+#   match that upstream API (EbxXmlWriter(Stream, AssetManager) +
+#   WriteObjects(IEnumerable<object>)).  Override permanently with the
+#   repository variables FROSTY_TOOLSUITE_REPO / FROSTY_TOOLSUITE_REF, or per
+#   run through the workflow_dispatch inputs frosty_repo / frosty_ref.
+#
+# Known code-side blocker (not a workflow problem)
+#   Bridge/McpHandlers.cs GetEbxYaml() calls
+#       new EbxYamlWriter(ms, App.AssetManager) / writer.WriteObjects(asset.RootObjects)
+#   There is no EbxYamlWriter in ANY branch of CadeEvs/FrostyToolsuite
+#   (1.0.6 ... 1.0.7) - only EbxXmlWriter - and the fork that does have one
+#   (HarGabt/FrostyToolsuite) uses a different signature
+#   (EbxAsset, Stream, AssetManager, int, bool + parameterless WriteObjects()).
+#   Until that call site is fixed or a Toolsuite that provides the expected
+#   signature is used, the compile stops with CS0246 EbxYamlWriter.
+#
 # Manual run
 #   Actions -> build -> Run workflow, optionally overriding the FrostyToolsuite
-#   ref (branch/tag/commit) that the plugin is compiled against.
+#   repository and ref the plugin is compiled against.
 # ---------------------------------------------------------------------------
 name: build
 
@@ -44,6 +61,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      frosty_repo:
+        description: FrostyToolsuite repository (owner/name) to build against
+        required: false
+        type: string
+        default: CadeEvs/FrostyToolsuite
       frosty_ref:
         description: FrostyToolsuite branch/tag/commit to build against
         required: false
@@ -58,8 +80,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Branch/tag of CadeEvs/FrostyToolsuite the plugin is compiled against.
-  FROSTY_TOOLSUITE_REF: ${{ github.event.inputs.frosty_ref || '1.0.6.3' }}
+  # FrostyToolsuite the plugin is compiled against.
+  # Resolution order: dispatch input > repository variable > default.
+  # To use another source (your own fork) permanently, set the repository
+  # variables FROSTY_TOOLSUITE_REPO / FROSTY_TOOLSUITE_REF under
+  # Settings -> Secrets and variables -> Actions -> Variables.
+  FROSTY_TOOLSUITE_REPO: ${{ inputs.frosty_repo || vars.FROSTY_TOOLSUITE_REPO || 'CadeEvs/FrostyToolsuite' }}
+  FROSTY_TOOLSUITE_REF: ${{ inputs.frosty_ref || vars.FROSTY_TOOLSUITE_REF || '1.0.6.3' }}
 
 jobs:
   # -------------------------------------------------------------------------
@@ -114,10 +141,10 @@ jobs:
           path: plugin
           persist-credentials: false
 
-      - name: Checkout FrostyToolsuite (${{ env.FROSTY_TOOLSUITE_REF }})
+      - name: Checkout FrostyToolsuite (${{ env.FROSTY_TOOLSUITE_REPO }}@${{ env.FROSTY_TOOLSUITE_REF }})
         uses: actions/checkout@v7
         with:
-          repository: CadeEvs/FrostyToolsuite
+          repository: ${{ env.FROSTY_TOOLSUITE_REPO }}
           ref: ${{ env.FROSTY_TOOLSUITE_REF }}
           path: FrostyToolsuite
           fetch-depth: 1
@@ -138,7 +165,7 @@ jobs:
           $rev = (& git -C $toolsuite rev-parse HEAD).Trim()
           $detail = @(
               $line
-              "FrostyToolsuite: $rev ($env:FROSTY_TOOLSUITE_REF)"
+              "FrostyToolsuite: $rev ($env:FROSTY_TOOLSUITE_REPO@$env:FROSTY_TOOLSUITE_REF)"
               "Configuration  : ${{ matrix.configuration }} | Platform: x64"
               "Target runtime : net48 (.NET Framework 4.8, in-box since Windows 10 21H2 / build 19044)"
           )
