@@ -273,7 +273,7 @@ jobs:
           Write-Problem ("dotnet sdks: " + ((& dotnet --list-sdks) -join '; '))
           throw "MSBuild failed with exit code $code"
 
-      - name: Verify build output (.NET Framework 4.x, x64, post-build copy)
+      - name: Verify build output (net48 + x64, probed with the in-box .NET Framework)
         env:
           OUTDIR: ${{ matrix.outdir }}
         run: |
@@ -305,12 +305,27 @@ jobs:
               if ($candidates.Count -ne 1) { throw "cannot identify the built plugin DLL ($($candidates.Count) candidate(s))" }
               $dll = $candidates[0].FullName
           }
-
-          $asm = [System.Reflection.AssemblyName]::GetAssemblyName($dll)
           $size = (Get-Item $dll).Length
+
+          # Probe the artifact with Windows PowerShell 5.1 - the in-box .NET
+          # Framework 4.8 that Windows 10 21H2 ships. pwsh 7 runs on .NET 9,
+          # where AssemblyName.ImageRuntimeVersion is always empty and
+          # ProcessorArchitecture is always None, so it cannot answer
+          # "will this load in Frosty Editor on 21H2?".
+          $probeScript = '& { $ErrorActionPreference = "Stop"; $a = [System.Reflection.AssemblyName]::GetAssemblyName("' + $dll + '"); [string]::Format("{0}|{1}|{2}|{3}", $a.ImageRuntimeVersion, $a.ProcessorArchitecture, $a.Version, [System.Environment]::Version.ToString()) }'
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probeScript))
+          $probe = [string](& powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded)
+          $fields = $probe.Trim().Split('|')
+          if ($fields.Count -lt 4) {
+              Note "the in-box .NET Framework probe returned unreadable output: '$probe'"
+              throw 'in-box .NET Framework probe failed'
+          }
+          $clr, $arch, $asmVersion, $fxVersion = $fields
           Write-Host "Artifact             : $dll ($size bytes)"
-          Write-Host "ImageRuntimeVersion  : $($asm.ImageRuntimeVersion)"
-          Write-Host "ProcessorArchitecture: $($asm.ProcessorArchitecture)"
+          Write-Host "Assembly version     : $asmVersion"
+          Write-Host "CLR image version    : $clr"
+          Write-Host "ProcessorArchitecture: $arch"
+          Write-Host "Probing framework    : $fxVersion (in-box, Windows PowerShell 5.1)"
 
           # The csproj PostBuild target copies the plugin into the editor's
           # Plugins folder. Accept it anywhere below FrostyEditor (the editor's
@@ -319,15 +334,15 @@ jobs:
           $copy = if ($copies.Count -gt 0) { $copies[0].FullName } else { $null }
 
           $problems = @()
-          if ($asm.ImageRuntimeVersion -ne 'v4.0.30319') {
-              $problems += "Expected a .NET Framework v4.0.30319 (net48) assembly but got '$($asm.ImageRuntimeVersion)' - it would not load in Frosty Editor on Windows 10 21H2."
+          if ($clr -ne 'v4.0.30319') {
+              $problems += "Expected a .NET Framework v4.0.30319 (net48) assembly but got '$clr' - it would not load in Frosty Editor on Windows 10 21H2."
           }
-          switch ($asm.ProcessorArchitecture) {
+          switch ($arch) {
               'Amd64' { Write-Host 'x64 assembly: OK' }
               'MSIL' {
                   Write-Warning 'Assembly is AnyCPU (MSIL); Frosty Editor is x64 so this still loads, but -p:Platform=x64 did not reach the compiler.'
               }
-              default { $problems += "Unexpected ProcessorArchitecture '$($asm.ProcessorArchitecture)' for an x64 Frosty plugin." }
+              default { $problems += "Unexpected ProcessorArchitecture '$arch' for an x64 Frosty plugin." }
           }
           if ($copy) {
               Write-Host "Post-build copy      : $copy"
@@ -335,9 +350,9 @@ jobs:
               $pluginsDirs = @(Get-ChildItem -Path $editorDir -Recurse -Directory -ErrorAction SilentlyContinue |
                   Where-Object { $_.Name -eq 'Plugins' } | Select-Object -First 10 |
                   ForEach-Object { $_.FullName.Replace($env:GITHUB_WORKSPACE, '') })
-              $clouds = @(Get-ChildItem -Path $editorDir -Directory -ErrorAction SilentlyContinue |
+              $entries = @(Get-ChildItem -Path $editorDir -Directory -ErrorAction SilentlyContinue |
                   Select-Object -First 20 | ForEach-Object { $_.Name })
-              $problems += "post-build plugin copy missing below FrostyEditor (csproj PostBuild target did not run or wrote elsewhere). Plugins dirs: $($pluginsDirs -join ' | ') | FrostyEditor entries: $($clouds -join ' | ')"
+              $problems += "post-build plugin copy missing below FrostyEditor (csproj PostBuild target did not run or wrote elsewhere). Plugins dirs: $($pluginsDirs -join ' | ') | FrostyEditor entries: $($entries -join ' | ')"
           }
           if ($problems.Count -gt 0) {
               foreach ($problem in $problems) { Note $problem }
@@ -345,13 +360,15 @@ jobs:
           }
 
           @(
-              'Build verified for Windows 10 21H2+ (net48, x64)'
+              'Build verified for Windows 10 21H2+ (net48, x64) - probed with the in-box .NET Framework'
               ''
               '| item | value |'
               '| --- | --- |'
               "| DLL | ``$($dll.Replace($env:GITHUB_WORKSPACE, ''))`` ($size bytes) |"
-              "| CLR header | $($asm.ImageRuntimeVersion) |"
-              "| Architecture | $($asm.ProcessorArchitecture) |"
+              "| Assembly version | $asmVersion |"
+              "| CLR image version | $clr |"
+              "| ProcessorArchitecture | $arch |"
+              "| Probing framework | $fxVersion |"
               "| Editor plugin copy | ``$($copy.Replace($env:GITHUB_WORKSPACE, ''))`` |"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
