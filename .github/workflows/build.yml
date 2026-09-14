@@ -279,9 +279,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Job logs need repository admin rights, so annotations are the only
-          # failure channel readable without authentication: every diagnostic and
-          # every problem goes out through Note().
+          # Job logs need repository admin rights, so annotations are the only failure
+          # channel readable without authentication: every diagnostic and every problem
+          # goes out through Note().
           function Note([string] $text) {
               $safe = $text.Trim() -replace '%', '%25' -replace "`r", '' -replace "`n", ' '
               if ($safe.Length -gt 900) { $safe = $safe.Substring(0, 900) + ' ...' }
@@ -289,137 +289,159 @@ jobs:
               Write-Host "::error::$safe"
           }
 
-          $pluginDir = Join-Path $env:GITHUB_WORKSPACE 'plugin'
-          $editorDir = Join-Path $env:GITHUB_WORKSPACE 'FrostyToolsuite/FrostyEditor'
-          $expectedDll = Join-Path $pluginDir "$($env:OUTDIR)/FrostyMcpPlugin.dll"
+          # ::notice:: markers say how far the step got when something throws.
+          function Mark([string] $text) { Write-Host "::notice::$text" }
 
-          # The DLL must be exactly where the matrix cell says it is; fall back to
-          # a search (instead of failing blind) so a moved OutputPath is visible.
-          $dll = $expectedDll
-          if (-not (Test-Path $expectedDll)) {
-              $candidates = @(Get-ChildItem -Path $pluginDir -Filter 'FrostyMcpPlugin.dll' -Recurse -File -ErrorAction SilentlyContinue |
-                  Where-Object { $_.FullName -notlike '*obj*' })
-              $dirs = @(Get-ChildItem -Path (Join-Path $pluginDir 'bin') -Recurse -Directory -ErrorAction SilentlyContinue |
-                  Select-Object -First 15 | ForEach-Object { $_.FullName.Replace($env:GITHUB_WORKSPACE, '') })
-              Note "expected DLL missing: $expectedDll | found: $($candidates.FullName -join ' | ') | dirs under plugin/bin: $($dirs -join ' | ')"
-              if ($candidates.Count -ne 1) { throw "cannot identify the built plugin DLL ($($candidates.Count) candidate(s))" }
-              $dll = $candidates[0].FullName
-          }
+          try {
+              $pluginDir = Join-Path $env:GITHUB_WORKSPACE 'plugin'
+              $editorDir = Join-Path $env:GITHUB_WORKSPACE 'FrostyToolsuite/FrostyEditor'
+              $expectedDll = Join-Path $pluginDir "$($env:OUTDIR)/FrostyMcpPlugin.dll"
 
-          # Read the PE / CLI headers straight out of the file. Reflection is not
-          # usable here: AssemblyName.ImageRuntimeVersion is empty under pwsh 7
-          # (.NET 9) and returns nothing useful under Windows PowerShell 5.1
-          # either, and this check has to be trustworthy in both.
-          $bytes = [System.IO.File]::ReadAllBytes($dll)
-          function U16([int] $offset) { [BitConverter]::ToUInt16($bytes, $offset) }
-          function U32([int] $offset) { [BitConverter]::ToUInt32($bytes, $offset) }
-
-          $dllSize = $bytes.Length
-          if ($dllSize -lt 256) { Note "not a PE file ($dllSize bytes): $dll"; throw 'artifact is not a PE file' }
-          $peOffset = U32 0x3c
-          if ($peOffset -lt 0x40 -or $peOffset + 24 -gt $dllSize -or (U32 $peOffset) -ne 0x00004550) {
-              Note "no PE signature at 0x$('{0:x}' -f $peOffset) in $dll"
-              throw 'artifact is not a PE file'
-          }
-
-          $machine = U16 ($peOffset + 4)
-          $sectionCount = U16 ($peOffset + 6)
-          $optionalSize = U16 ($peOffset + 20)
-          $optional = $peOffset + 24
-          $magic = U16 $optional
-          $isPe32Plus = $magic -eq 0x20b
-          $dataDirs = $optional + $(if ($isPe32Plus) { 112 } else { 96 })
-          $cliRva = U32 ($dataDirs + 14 * 8)
-
-          $sections = @()
-          $sectionTable = $optional + $optionalSize
-          for ($i = 0; $i -lt $sectionCount; $i++) {
-              $header = $sectionTable + $i * 40
-              $sections += [pscustomobject]@{
-                  VirtualSize = U32 ($header + 8)
-                  VirtualAddress = U32 ($header + 12)
-                  RawPointer = U32 ($header + 20)
+              # The DLL must be exactly where the matrix cell says it is; fall back to a
+              # search (instead of failing blind) so a moved OutputPath is visible.
+              $dll = $expectedDll
+              if (-not (Test-Path $expectedDll)) {
+                  $candidates = @(Get-ChildItem -Path $pluginDir -Filter 'FrostyMcpPlugin.dll' -Recurse -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -notlike '*obj*' })
+                  $dirs = @(Get-ChildItem -Path (Join-Path $pluginDir 'bin') -Recurse -Directory -ErrorAction SilentlyContinue |
+                      Select-Object -First 15 | ForEach-Object { $_.FullName.Replace($env:GITHUB_WORKSPACE, '') })
+                  Note "expected DLL missing: $expectedDll | found: $($candidates.FullName -join ' | ') | dirs under plugin/bin: $($dirs -join ' | ')"
+                  if ($candidates.Count -ne 1) { throw "cannot identify the built plugin DLL ($($candidates.Count) candidate(s))" }
+                  $dll = $candidates[0].FullName
               }
-          }
-          function RvaToOffset([int] $rva) {
-              foreach ($section in $sections) {
-                  if ($rva -ge $section.VirtualAddress -and $rva -lt ($section.VirtualAddress + $section.VirtualSize)) {
-                      return $section.RawPointer + ($rva - $section.VirtualAddress)
+
+              # Read the PE / CLI headers straight out of the file. Neither pwsh 7 nor
+              # Windows PowerShell 5.1 reports ImageRuntimeVersion reliably through
+              # AssemblyName, and this check has to be trustworthy in both, so the bytes
+              # are the source of truth.
+              $bytes = [System.IO.File]::ReadAllBytes($dll)
+              function U16([int] $offset) { [BitConverter]::ToUInt16($bytes, $offset) }
+              function U32([int] $offset) { [BitConverter]::ToUInt32($bytes, $offset) }
+
+              $dllSize = $bytes.Length
+              if ($dllSize -lt 256) { throw "not a PE file ($dllSize bytes): $dll" }
+              $peOffset = U32 0x3c
+              if ($peOffset -lt 0x40 -or $peOffset + 24 -gt $dllSize -or (U32 $peOffset) -ne 0x00004550) {
+                  throw "no PE signature at 0x$('{0:x}' -f $peOffset) in $dll"
+              }
+
+              $machine = U16 ($peOffset + 4)
+              $sectionCount = U16 ($peOffset + 6)
+              $optionalSize = U16 ($peOffset + 20)
+              $optional = $peOffset + 24
+              $isPe32Plus = (U16 $optional) -eq 0x20b
+              $dataDirectories = $optional + $(if ($isPe32Plus) { 112 } else { 96 })
+              $cliRva = U32 ($dataDirectories + 14 * 8)
+
+              $sections = @()
+              $sectionTable = $optional + $optionalSize
+              for ($i = 0; $i -lt $sectionCount; $i++) {
+                  $header = $sectionTable + $i * 40
+                  $sections += [pscustomobject]@{
+                      VirtualSize = U32 ($header + 8)
+                      VirtualAddress = U32 ($header + 12)
+                      RawPointer = U32 ($header + 20)
                   }
               }
-              return -1
+              function RvaToOffset([int] $rva) {
+                  foreach ($section in $sections) {
+                      if ($rva -ge $section.VirtualAddress -and $rva -lt ($section.VirtualAddress + $section.VirtualSize)) {
+                          return $section.RawPointer + ($rva - $section.VirtualAddress)
+                      }
+                  }
+                  return -1
+              }
+
+              $clrFlags = $null
+              $runtimeVersion = ''
+              if ($cliRva -eq 0) {
+                  Write-Host "No CLI header (data directory 14 is empty): $dll is a native image."
+              } else {
+                  $cliOffset = RvaToOffset $cliRva
+                  # COR20: cb(4) major(2) minor(2) MetaDataRva(4) MetaDataSize(4) Flags(4)
+                  $clrFlags = U32 ($cliOffset + 16)
+                  $metadataOffset = RvaToOffset (U32 ($cliOffset + 8))
+                  # Metadata root: Signature(4) Major(2) Minor(2) Reserved(4) VersionLength(4) VersionString
+                  $rootSignature = U32 $metadataOffset
+                  $versionLength = U32 ($metadataOffset + 12)
+                  if ($rootSignature -ne 0x424a5342) {
+                      Note "metadata root signature is 0x$('{0:x}' -f $rootSignature) instead of 0x424a5342 (BSJB) at offset $metadataOffset"
+                  } elseif ($versionLength -lt 1 -or $versionLength -gt 255) {
+                      Note "implausible metadata version length $versionLength at offset $($metadataOffset + 12)"
+                  } else {
+                      $runtimeVersion = [Text.Encoding]::UTF8.GetString($bytes, $metadataOffset + 16, $versionLength).TrimEnd([char] 0)
+                  }
+              }
+
+              $machineName = switch ($machine) {
+                  0x8664 { 'x64' }
+                  0x14c { 'x86' }
+                  0xaa64 { 'arm64' }
+                  default { '0x{0:x}' -f $machine }
+              }
+              $ilOnly = if ($null -ne $clrFlags) { ($clrFlags -band 0x1) -ne 0 } else { $false }
+
+              # Evidence that the artifact targets the framework 21H2 ships in the box.
+              $inBox = ''
+              try {
+                  $inBox = [string](& powershell.exe -NoProfile -NonInteractive -Command '[System.Environment]::Version.ToString()')
+              } catch {
+                  $inBox = "unavailable ($($_.Exception.Message))"
+              }
+
+              Mark "PE machine $machineName (PE32+ $isPe32Plus), CLI runtime '$runtimeVersion', IL-only $ilOnly, in-box framework $(([string]$inBox).Trim())"
+              Write-Host "Artifact         : $dll ($dllSize bytes)"
+              Write-Host "PE machine       : $machineName (PE32+ = $isPe32Plus)"
+              Write-Host "CLI runtime      : $runtimeVersion (IL-only = $ilOnly)"
+              Write-Host "In-box framework : $(([string]$inBox).Trim())"
+
+              # The csproj PostBuild target copies the plugin into the editor's Plugins
+              # folder. Accept it anywhere below FrostyEditor (the editor's own OutDir may
+              # differ from the plugin's) but require it to exist.
+              $copies = @(Get-ChildItem -Path $editorDir -Filter 'FrostyMcpPlugin.dll' -Recurse -File -ErrorAction SilentlyContinue)
+              $copy = if ($copies.Count -gt 0) { $copies[0].FullName } else { $null }
+
+              $problems = @()
+              if ($machine -ne 0x8664 -or -not $isPe32Plus) {
+                  $problems += "Expected an x64 image (machine 0x8664, PE32+) but got machine $machineName / PE32+ = $isPe32Plus - Frosty Editor and its FrostySdk dependency are x64 only."
+              }
+              if ($runtimeVersion -ne 'v4.0.30319') {
+                  $problems += "Expected CLR metadata version 'v4.0.30319' (net48) but got '$runtimeVersion' - it would not load in Frosty Editor on Windows 10 21H2."
+              }
+              if ($null -ne $clrFlags -and -not $ilOnly) {
+                  Write-Warning 'CLI header lacks the IL-only flag (mixed mode); the plugin would need a matching native runtime on the target machine.'
+              }
+              if ($copy) {
+                  Write-Host "Post-build copy  : $copy"
+              } else {
+                  $pluginsDirs = @(Get-ChildItem -Path $editorDir -Recurse -Directory -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -eq 'Plugins' } | Select-Object -First 10 |
+                      ForEach-Object { $_.FullName.Replace($env:GITHUB_WORKSPACE, '') })
+                  $entries = @(Get-ChildItem -Path $editorDir -Directory -ErrorAction SilentlyContinue |
+                      Select-Object -First 20 | ForEach-Object { $_.Name })
+                  $problems += "post-build plugin copy missing below FrostyEditor (csproj PostBuild target did not run or wrote elsewhere). Plugins dirs: $($pluginsDirs -join ' | ') | FrostyEditor entries: $($entries -join ' | ')"
+              }
+              if ($problems.Count -gt 0) {
+                  foreach ($problem in $problems) { Note $problem }
+                  throw ($problems -join ' // ')
+              }
+
+              @(
+                  'Build verified for Windows 10 21H2+ (net48, x64)'
+                  ''
+                  '| item | value |'
+                  '| --- | --- |'
+                  "| DLL | ``$($dll.Replace($env:GITHUB_WORKSPACE, ''))`` ($dllSize bytes) |"
+                  "| PE machine | $machineName (PE32+ = $isPe32Plus) |"
+                  "| CLI runtime | $runtimeVersion (IL-only = $ilOnly) |"
+                  "| In-box .NET Framework | $(([string]$inBox).Trim()) |"
+                  "| Editor plugin copy | ``$($copy.Replace($env:GITHUB_WORKSPACE, ''))`` |"
+              ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          } catch {
+              Note "the artifact check itself failed: $($_.Exception.Message) | at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim()) | stack: $($_.ScriptStackTrace)"
+              exit 1
           }
 
-          $clrFlags = $null
-          $runtimeVersion = ''
-          if ($cliRva -eq 0) {
-              Note "no CLI header (data directory 14 is empty) - $dll is a native image, not a managed assembly"
-          } else {
-              $cliOffset = RvaToOffset $cliRva
-              $clrFlags = U32 ($cliOffset + 16)
-              $metadataOffset = RvaToOffset (U32 ($cliOffset + 8))
-              $versionLength = U32 $metadataOffset
-              $runtimeVersion = [Text.Encoding]::UTF8.GetString($bytes, $metadataOffset + 4, $versionLength).TrimEnd([char] 0)
-          }
-
-          $machineName = switch ($machine) {
-              0x8664 { 'x64' }
-              0x14c { 'x86' }
-              0xaa64 { 'arm64' }
-              default { '0x{0:x}' -f $machine }
-          }
-          $ilOnly = if ($null -ne $clrFlags) { ($clrFlags -band 0x1) -ne 0 } else { $false }
-
-          # Evidence that the artifact targets the framework 21H2 ships in the box.
-          $inBox = [string](& powershell.exe -NoProfile -NonInteractive -Command '[System.Environment]::Version.ToString()')
-
-          Write-Host "Artifact          : $dll ($dllSize bytes)"
-          Write-Host "PE machine        : $machineName (PE32+ = $isPe32Plus)"
-          Write-Host "CLI runtime       : $runtimeVersion (IL-only = $ilOnly)"
-          Write-Host "In-box framework  : $($inBox.Trim())"
-
-          # The csproj PostBuild target copies the plugin into the editor's
-          # Plugins folder. Accept it anywhere below FrostyEditor (the editor's
-          # own OutDir may differ from the plugin's) but require it to exist.
-          $copies = @(Get-ChildItem -Path $editorDir -Filter 'FrostyMcpPlugin.dll' -Recurse -File -ErrorAction SilentlyContinue)
-          $copy = if ($copies.Count -gt 0) { $copies[0].FullName } else { $null }
-
-          $problems = @()
-          if ($machine -ne 0x8664 -or -not $isPe32Plus) {
-              $problems += "Expected an x64 image (machine 0x8664, PE32+) but got machine $machineName / PE32+ = $isPe32Plus - Frosty Editor (and its FrostySdk dependency) is x64 only."
-          }
-          if ($runtimeVersion -ne 'v4.0.30319') {
-              $problems += "Expected CLR metadata version 'v4.0.30319' (net48) but got '$runtimeVersion' - it would not load in Frosty Editor on Windows 10 21H2."
-          }
-          if ($null -ne $clrFlags -and -not $ilOnly) {
-              Write-Warning 'CLI header lacks the IL-only flag (mixed mode); the plugin would need a matching native runtime on the target machine.'
-          }
-          if ($copy) {
-              Write-Host "Post-build copy   : $copy"
-          } else {
-              $pluginsDirs = @(Get-ChildItem -Path $editorDir -Recurse -Directory -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -eq 'Plugins' } | Select-Object -First 10 |
-                  ForEach-Object { $_.FullName.Replace($env:GITHUB_WORKSPACE, '') })
-              $entries = @(Get-ChildItem -Path $editorDir -Directory -ErrorAction SilentlyContinue |
-                  Select-Object -First 20 | ForEach-Object { $_.Name })
-              $problems += "post-build plugin copy missing below FrostyEditor (csproj PostBuild target did not run or wrote elsewhere). Plugins dirs: $($pluginsDirs -join ' | ') | FrostyEditor entries: $($entries -join ' | ')"
-          }
-          if ($problems.Count -gt 0) {
-              foreach ($problem in $problems) { Note $problem }
-              throw ($problems -join ' // ')
-          }
-
-          @(
-              'Build verified for Windows 10 21H2+ (net48, x64)'
-              ''
-              '| item | value |'
-              '| --- | --- |'
-              "| DLL | ``$($dll.Replace($env:GITHUB_WORKSPACE, ''))`` ($dllSize bytes) |"
-              "| PE machine | $machineName (PE32+ = $isPe32Plus) |"
-              "| CLI runtime | $runtimeVersion (IL-only = $ilOnly) |"
-              "| In-box .NET Framework | $($inBox.Trim()) |"
-              "| Editor plugin copy | ``$($copy.Replace($env:GITHUB_WORKSPACE, ''))`` |"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Upload build output
         uses: actions/upload-artifact@v7
