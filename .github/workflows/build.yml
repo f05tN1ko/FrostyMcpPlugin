@@ -181,6 +181,7 @@ jobs:
           # Forward slashes keep the trailing separator unambiguous for argument
           # passing; MSBuild accepts them on Windows.
           $frostyRoot = (Join-Path $env:GITHUB_WORKSPACE 'FrostyToolsuite').Replace('\', '/') + '/'
+          $logFile = Join-Path $env:RUNNER_TEMP 'msbuild.log'
           Write-Host "Configuration: $env:CONFIGURATION"
           Write-Host "FrostyRoot   : $frostyRoot"
           $msbuildArgs = @(
@@ -193,8 +194,37 @@ jobs:
               "-p:FrostyRoot=$frostyRoot"
               "-bl:$($env:GITHUB_WORKSPACE)/msbuild-${{ matrix.slug }}.binlog"
           )
-          & msbuild @msbuildArgs
-          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
+          & msbuild @msbuildArgs 2>&1 | Tee-Object -FilePath $logFile
+          $code = $LASTEXITCODE
+          if ($code -eq 0) {
+              Write-Host 'MSBuild succeeded.'
+              exit 0
+          }
+
+          # --- diagnostics -----------------------------------------------------
+          # Job logs of this repo are not readable without an authenticated API
+          # call, so the interesting lines are republished as check-run
+          # annotations (visible in the UI and through the public Checks API).
+          function Write-Problem([string] $text) {
+              $safe = $text.Trim() -replace '%', '%25' -replace "`r", '' -replace "`n", ' '
+              if ($safe.Length -gt 900) { $safe = $safe.Substring(0, 900) + ' ...' }
+              Write-Host $safe
+              Write-Host "::error::$safe"
+          }
+          $problems = @(
+              Get-Content -LiteralPath $logFile |
+                  Where-Object { $_ -match 'error\s+[A-Z]+\d+' -or $_ -match 'fatal error' -or $_ -match ':\s+error\s' } |
+                  Select-Object -First 25
+          )
+          if ($problems.Count -gt 0) {
+              foreach ($line in $problems) { Write-Problem $line }
+          } else {
+              Write-Host 'No line matched the MSBuild error pattern; publishing the log tail instead.'
+              foreach ($line in @(Get-Content -LiteralPath $logFile | Select-Object -Last 30)) { Write-Problem $line }
+          }
+          Write-Problem ("msbuild: " + ((& msbuild -version -nologo) -join '; '))
+          Write-Problem ("dotnet sdks: " + ((& dotnet --list-sdks) -join '; '))
+          throw "MSBuild failed with exit code $code"
 
       - name: Verify build output (.NET Framework 4.x, x64, post-build copy)
         env:
