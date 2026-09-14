@@ -45,6 +45,12 @@
     <Reference Include="PresentationFramework" />
     <Reference Include="System.Xaml" />
     <Reference Include="WindowsBase" />
+    <!-- Bridge/Mcp*Handlers.cs use `dynamic`, which needs the Microsoft.CSharp
+         binder. It used to arrive transitively through the FrostyToolsuite projects;
+         the WPF markup-compile temp project does not carry package-derived transitive
+         references, so it must be referenced explicitly or the build fails with
+         CS0656 (Missing compiler required member ...CSharpArgumentInfo.Create). -->
+    <Reference Include="Microsoft.CSharp" />
     <!-- Frosty binaries / third-party (adjust FrostyRoot if your Toolsuite is elsewhere) -->
     <Reference Include="Newtonsoft.Json">
       <HintPath>$(FrostyRoot)FrostyEditor\ThirdParty\Newtonsoft.Json.dll</HintPath>
