@@ -278,44 +278,81 @@ jobs:
           OUTDIR: ${{ matrix.outdir }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $dll = Join-Path $env:GITHUB_WORKSPACE ("plugin/$($env:OUTDIR)/FrostyMcpPlugin.dll")
-          if (-not (Test-Path $dll)) { throw "Build output missing: $dll" }
+
+          # Job logs need repository admin rights, so annotations are the only
+          # failure channel readable without authentication: every diagnostic and
+          # every problem goes out through Note().
+          function Note([string] $text) {
+              $safe = $text.Trim() -replace '%', '%25' -replace "`r", '' -replace "`n", ' '
+              if ($safe.Length -gt 900) { $safe = $safe.Substring(0, 900) + ' ...' }
+              Write-Host $safe
+              Write-Host "::error::$safe"
+          }
+
+          $pluginDir = Join-Path $env:GITHUB_WORKSPACE 'plugin'
+          $editorDir = Join-Path $env:GITHUB_WORKSPACE 'FrostyToolsuite/FrostyEditor'
+          $expectedDll = Join-Path $pluginDir "$($env:OUTDIR)/FrostyMcpPlugin.dll"
+
+          # The DLL must be exactly where the matrix cell says it is; fall back to
+          # a search (instead of failing blind) so a moved OutputPath is visible.
+          $dll = $expectedDll
+          if (-not (Test-Path $expectedDll)) {
+              $candidates = @(Get-ChildItem -Path $pluginDir -Filter 'FrostyMcpPlugin.dll' -Recurse -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -notlike '*obj*' })
+              $dirs = @(Get-ChildItem -Path (Join-Path $pluginDir 'bin') -Recurse -Directory -ErrorAction SilentlyContinue |
+                  Select-Object -First 15 | ForEach-Object { $_.FullName.Replace($env:GITHUB_WORKSPACE, '') })
+              Note "expected DLL missing: $expectedDll | found: $($candidates.FullName -join ' | ') | dirs under plugin/bin: $($dirs -join ' | ')"
+              if ($candidates.Count -ne 1) { throw "cannot identify the built plugin DLL ($($candidates.Count) candidate(s))" }
+              $dll = $candidates[0].FullName
+          }
 
           $asm = [System.Reflection.AssemblyName]::GetAssemblyName($dll)
           $size = (Get-Item $dll).Length
-          Write-Host "Artifact            : $dll ($size bytes)"
-          Write-Host "ImageRuntimeVersion : $($asm.ImageRuntimeVersion)"
+          Write-Host "Artifact             : $dll ($size bytes)"
+          Write-Host "ImageRuntimeVersion  : $($asm.ImageRuntimeVersion)"
           Write-Host "ProcessorArchitecture: $($asm.ProcessorArchitecture)"
 
-          # CLR header must be .NET Framework 4.x: that is what Windows 10 21H2
-          # (and Frosty Editor, itself net48) can load. A .NET 5+/Core assembly
-          # would build fine here but fail in Frosty on the target machine.
+          # The csproj PostBuild target copies the plugin into the editor's
+          # Plugins folder. Accept it anywhere below FrostyEditor (the editor's
+          # own OutDir may differ from the plugin's) but require it to exist.
+          $copies = @(Get-ChildItem -Path $editorDir -Filter 'FrostyMcpPlugin.dll' -Recurse -File -ErrorAction SilentlyContinue)
+          $copy = if ($copies.Count -gt 0) { $copies[0].FullName } else { $null }
+
+          $problems = @()
           if ($asm.ImageRuntimeVersion -ne 'v4.0.30319') {
-              throw "Expected a .NET Framework v4.0.30319 (net48) assembly but got '$($asm.ImageRuntimeVersion)' - it would not load in Frosty Editor on Windows 10 21H2."
+              $problems += "Expected a .NET Framework v4.0.30319 (net48) assembly but got '$($asm.ImageRuntimeVersion)' - it would not load in Frosty Editor on Windows 10 21H2."
           }
           switch ($asm.ProcessorArchitecture) {
               'Amd64' { Write-Host 'x64 assembly: OK' }
               'MSIL' {
                   Write-Warning 'Assembly is AnyCPU (MSIL); Frosty Editor is x64 so this still loads, but -p:Platform=x64 did not reach the compiler.'
               }
-              default { throw "Unexpected ProcessorArchitecture '$($asm.ProcessorArchitecture)' for an x64 Frosty plugin." }
+              default { $problems += "Unexpected ProcessorArchitecture '$($asm.ProcessorArchitecture)' for an x64 Frosty plugin." }
           }
-
-          # The csproj PostBuild target copies the plugin into the editor's
-          # Plugins folder: FrostyEditor\<OutDir>Plugins\. Verify it really happened.
-          $copy = Join-Path $env:GITHUB_WORKSPACE ("FrostyToolsuite/FrostyEditor/$($env:OUTDIR)/Plugins/FrostyMcpPlugin.dll")
-          if (-not (Test-Path $copy)) { throw "Post-build plugin copy missing: $copy" }
-          Write-Host "Post-build copy     : $copy"
+          if ($copy) {
+              Write-Host "Post-build copy      : $copy"
+          } else {
+              $pluginsDirs = @(Get-ChildItem -Path $editorDir -Recurse -Directory -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -eq 'Plugins' } | Select-Object -First 10 |
+                  ForEach-Object { $_.FullName.Replace($env:GITHUB_WORKSPACE, '') })
+              $clouds = @(Get-ChildItem -Path $editorDir -Directory -ErrorAction SilentlyContinue |
+                  Select-Object -First 20 | ForEach-Object { $_.Name })
+              $problems += "post-build plugin copy missing below FrostyEditor (csproj PostBuild target did not run or wrote elsewhere). Plugins dirs: $($pluginsDirs -join ' | ') | FrostyEditor entries: $($clouds -join ' | ')"
+          }
+          if ($problems.Count -gt 0) {
+              foreach ($problem in $problems) { Note $problem }
+              throw ($problems -join ' // ')
+          }
 
           @(
               'Build verified for Windows 10 21H2+ (net48, x64)'
               ''
               '| item | value |'
               '| --- | --- |'
-              "| DLL | ``plugin/$($env:OUTDIR)/FrostyMcpPlugin.dll`` ($size bytes) |"
+              "| DLL | ``$($dll.Replace($env:GITHUB_WORKSPACE, ''))`` ($size bytes) |"
               "| CLR header | $($asm.ImageRuntimeVersion) |"
               "| Architecture | $($asm.ProcessorArchitecture) |"
-              "| Editor plugin copy | ``FrostyToolsuite/FrostyEditor/$($env:OUTDIR)/Plugins/FrostyMcpPlugin.dll`` |"
+              "| Editor plugin copy | ``$($copy.Replace($env:GITHUB_WORKSPACE, ''))`` |"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Upload build output
